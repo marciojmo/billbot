@@ -1,0 +1,2 @@
+"""BillBot application package."""
+

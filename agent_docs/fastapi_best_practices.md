@@ -15,7 +15,7 @@ app/
 ├── core/
 │   ├── config.py        # Settings and configuration
 │   └── security.py      # Auth utilities
-├── models/              # Pydantic models (schemas)
+├── schemas/             # Pydantic schemas (validation)
 ├── services/            # Business logic
 └── db/                  # Database layer
 ```
