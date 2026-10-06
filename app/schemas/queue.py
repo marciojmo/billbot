@@ -6,6 +6,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
+MessageType = Literal["document", "photo", "text"]
+
 
 class ChatInfo(BaseModel):
     """Telegram chat information.
@@ -78,7 +80,7 @@ class QueueMessage(BaseModel):
 
     id: UUID = Field(default_factory=uuid4)
     timestamp: datetime = Field(default_factory=datetime.utcnow)
-    type: Literal["document", "photo", "text"]
+    type: MessageType
     chat: ChatInfo
     message: MessageInfo
     user: UserInfo

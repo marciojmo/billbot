@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class TelegramUpdate(BaseModel):
@@ -15,12 +15,9 @@ class TelegramUpdate(BaseModel):
         update_id: Unique update identifier.
     """
 
+    model_config = ConfigDict(extra="allow")
+
     update_id: int
-
-    class Config:
-        """Pydantic config."""
-
-        extra = "allow"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the model to a dictionary for telegram library parsing.

@@ -24,13 +24,12 @@ banking app. All user-facing messages are in Portuguese.
 ## Tech stack
 
 - Python 3.13, managed with [uv](https://docs.astral.sh/uv/)
-- [python-telegram-bot](https://python-telegram-bot.org/) 22 (polling mode)
-- FastAPI + Uvicorn (webhook mode — see [Status](#status-and-known-issues))
+- [python-telegram-bot](https://python-telegram-bot.org/) 22 (polling mode and all Telegram API calls)
+- FastAPI + Uvicorn (webhook mode)
 - SQLAlchemy 2 async + aiosqlite
 - Pydantic / pydantic-settings
 - OpenAI SDK (`gpt-4o`)
 - PyMuPDF for PDF → image rendering
-- httpx for direct Telegram API calls
 
 ## Requirements
 
@@ -53,6 +52,7 @@ OPENAI_API_KEY=sk-your-key
 
 # optional
 DATABASE_URL=sqlite+aiosqlite:///billbot.db
+OPENAI_MODEL=gpt-4o
 DEBUG=false
 ```
 
@@ -64,83 +64,103 @@ Both `.env` and `billbot.db` are gitignored.
 uv run python -m app.polling
 ```
 
-This is the supported way to run the bot. It initializes the database (creating
-`billbot.db` and its tables on first run), registers the consumers, starts the queue
+This is the primary way to run the bot. It initializes the database (creating
+`billbot.db` and its tables on first run), wires the consumers, starts the queue
 processor, and connects to Telegram in long-polling mode — no public URL or tunnel
-needed. If `TELEGRAM_BOT_TOKEN` is missing the process logs an error and exits with
-status 1.
+needed. If `TELEGRAM_BOT_TOKEN` or `OPENAI_API_KEY` is missing the process logs an error
+and exits with status 1.
+
+Webhook mode runs the same pipeline behind FastAPI:
+
+```bash
+uv run uvicorn app.main:app
+```
+
+Telegram must be pointed at `POST /api/webhook/telegram` (via `setWebhook`); `/health`
+returns `{"status": "healthy"}`.
 
 ## How it works
 
 ```
-Telegram message
-      │
+Telegram update (polling: app/bot/handlers.py · webhook: app/api/routes/webhook.py)
+      │  to_queue_message                ──► immediate "🔄 Processando..." reply
       ▼
- handler (app/polling.py)          ──► immediate "🔄 Processando..." reply
-      │  create_queue_message
-      ▼
- asyncio.Queue (app/services/queue.py)
-      │  process_queue runs every registered consumer in order
-      ├─► logger_consumer      — debug logging
-      ├─► ocr_consumer         — download → (PDF→PNG) → GPT-4o → store
-      └─► response_consumer    — reply with the user's boleto list
+ MessageQueue (app/worker/queue.py)
+      │  runs every consumer in order
+      ├─► LoggingConsumer   — debug logging
+      ├─► OcrConsumer       — download → (PDF→PNG) → GPT-4o → store
+      └─► ResponseConsumer  — reply with the user's boleto list
                                       │
                              SQLite (users, boletos)
 ```
 
-1. `/start`, document, photo and catch-all handlers in `app/polling.py` receive updates.
-2. `create_queue_message` (`app/services/queue.py`) normalizes the Telegram message into a
-   `QueueMessage` (`app/schemas/queue.py`) and `enqueue` puts it on an in-process
-   `asyncio.Queue`. The user is acked right away.
-3. `process_queue` drains the queue and runs each registered consumer in turn, logging and
-   swallowing per-consumer exceptions so one failure doesn't drop the message.
-4. `ocr_consumer` (`app/services/consumers.py`) fetches the file via the Telegram file API.
-   PDFs go through `convert_pdf_to_images` (`app/services/pdf_service.py`, PyMuPDF at
-   200 DPI, one PNG per page); images are used as-is.
-5. Each image is sent to `extract_boleto_data` (`app/services/ocr_service.py`), which
-   prompts `gpt-4o` for a JSON object and validates it into a `BoletoData`
-   (`app/schemas/ocr.py`).
-6. `store_boleto` (`app/services/storage.py`) gets or creates the `User`, parses the value
-   to cents and the due date to a `datetime`, and inserts a `Boleto`. A duplicate barcode
-   raises `IntegrityError` and is logged and ignored.
-7. `response_consumer` replies via `get_user_boletos_response`
-   (`app/services/message_handler.py`) with every stored boleto, newest first, formatted
-   as `*issuer - R$ value:*` followed by the barcode.
+1. Both entrypoints build a single `Container` (`app/container.py`), the composition root
+   that creates the database, OpenAI client, Telegram bot, services and queue, and wires
+   them together through constructor injection. Nothing else reads settings or holds
+   module-level state.
+2. `/start`, file and catch-all handlers (`app/bot/handlers.py`) — or the webhook route —
+   convert the Telegram message into a `QueueMessage` (`app/schemas/queue.py`) with
+   `to_queue_message` (`app/bot/mapper.py`) and enqueue it. The user is acked right away.
+3. `MessageQueue` drains the queue in a background task and runs each consumer in turn,
+   logging and swallowing per-consumer exceptions so one failure doesn't drop the message.
+4. `OcrConsumer` (`app/worker/consumers.py`) fetches the file through `TelegramGateway`
+   (`app/bot/gateway.py`). PDFs go through `render_pdf_pages` (`app/services/pdf.py`,
+   PyMuPDF at 200 DPI, one PNG per page, run off the event loop); images are used as-is.
+5. Each image is sent to `BoletoExtractor` (`app/services/ocr.py`), which prompts
+   `gpt-4o` for a JSON object and validates it into a `BoletoData`
+   (`app/schemas/boleto.py`).
+6. `BoletoService.store` (`app/services/boletos.py`) gets or creates the `User`, parses
+   the value to cents and the due date to a `datetime` (`app/services/parsing.py`), and
+   inserts a `Boleto` through the repositories in `app/repositories/`. A duplicate
+   barcode raises `IntegrityError` and is logged and ignored.
+7. `ResponseConsumer` replies with every stored boleto, newest first, formatted by
+   `format_boleto_list` (`app/bot/messages.py`) as `*issuer - R$ value:*` followed by
+   the barcode.
 
 ## Project layout
 
 ```
 app/
-├── main.py                   # FastAPI app: lifespan init_db, /health, /api router
-├── polling.py                # Polling entrypoint — the supported way to run the bot
+├── container.py              # Composition root: builds and wires all dependencies
+├── main.py                   # FastAPI app factory (webhook mode)
+├── polling.py                # Polling entrypoint
 ├── api/
-│   ├── dependencies.py       # (empty placeholder)
+│   ├── dependencies.py       # Depends() providers backed by the container
 │   └── routes/
-│       └── webhook.py        # POST /api/webhook/telegram (see Status)
+│       └── webhook.py        # POST /api/webhook/telegram
+├── bot/
+│   ├── gateway.py            # TelegramGateway: file downloads, sending messages
+│   ├── handlers.py           # python-telegram-bot handlers
+│   ├── mapper.py             # Telegram Message → QueueMessage
+│   └── messages.py           # All Portuguese user-facing text and formatters
 ├── core/
-│   └── config.py             # pydantic-settings Settings, loaded from .env
+│   ├── config.py             # pydantic-settings Settings, loaded from .env
+│   └── logging.py            # Logging setup
 ├── db/
-│   ├── models.py             # User, Boleto
-│   └── session.py            # async engine, sessionmaker, init_db
+│   ├── database.py           # Database: engine, sessions, table creation
+│   └── models.py             # User, Boleto
+├── repositories/
+│   ├── boletos.py            # BoletoRepository
+│   └── users.py              # UserRepository
 ├── schemas/
-│   ├── ocr.py                # BoletoData — the OCR contract
+│   ├── boleto.py             # BoletoData (OCR contract), StoredBoleto
 │   ├── queue.py              # QueueMessage + Chat/Message/User/FileInfo
 │   └── telegram.py           # Raw webhook payload validation
-└── services/
-    ├── command_handler.py    # /start greeting template
-    ├── consumers.py          # logger_consumer, ocr_consumer, download/send helpers
-    ├── message_handler.py    # Boleto list formatting
-    ├── ocr_service.py        # GPT-4o vision extraction
-    ├── pdf_service.py        # PDF → PNG via PyMuPDF
-    ├── queue.py              # In-process queue, consumer registry, processor
-    └── storage.py            # Users/boletos persistence and value/date parsing
+├── services/
+│   ├── boletos.py            # BoletoService: store and list boletos
+│   ├── ocr.py                # BoletoExtractor: GPT-4o vision extraction
+│   ├── parsing.py            # Currency and date parsing
+│   └── pdf.py                # PDF → PNG via PyMuPDF
+└── worker/
+    ├── consumers.py          # Consumer protocol and pipeline consumers
+    └── queue.py              # MessageQueue: in-process queue and processor
 ```
 
-`agent_docs/` holds the style guides this code follows — see [Conventions](#conventions).
+`docs/` holds the style guides this code follows — see [Conventions](#conventions).
 
 ## Data model
 
-Two tables, created automatically by `init_db` (`app/db/session.py`):
+Two tables, created automatically by `Database.create_tables` (`app/db/database.py`):
 
 - **`users`** — `telegram_id` (unique), `first_name`, `username`, `created_at`.
   Users are created lazily the first time they send a boleto.
@@ -167,23 +187,17 @@ with no pages each get their own message asking the user to try again.
 
 ## Status and known issues
 
-- **Webhook mode is broken.** `app/api/routes/webhook.py:10` imports `process_document`
-  and `process_photo` from `app.services.message_handler`, which no longer defines them,
-  so `import app.main` raises `ImportError` and neither `uv run uvicorn app.main:app` nor
-  `/health` nor `POST /api/webhook/telegram` can start. Use polling mode. Reviving the
-  webhook also means routing it through the queue, which it currently bypasses.
 - **The queue is in-process and non-durable** — anything still pending is lost on restart,
   and processing does not scale beyond a single instance.
-- **Unused code**: `format_boleto_response` (`app/services/ocr_service.py`) and
-  `get_queue_size` (`app/services/queue.py`); `app/api/dependencies.py` is an empty stub.
 - **No tests and no linter configuration** yet.
 
 ## Conventions
 
-The code follows the guides checked into `agent_docs/`:
+The code follows the guides checked into `docs/`:
 
-- `agent_docs/python_best_practices.md` — Google Python style: Google-format docstrings on
+- `docs/python_best_practices.md` — Google Python style: Google-format docstrings on
   every public function, type annotations throughout, explicit imports.
-- `agent_docs/fastapi_best_practices.md` — the `api` / `core` / `schemas` / `services` /
-  `db` layering this project uses, with business logic kept in `services/` and Pydantic
-  models kept in `schemas/`.
+- `docs/fastapi_best_practices.md` — the `api` / `core` / `schemas` / `services` /
+  `db` layering this project uses (plus `repositories`, `bot` and `worker`), with
+  business logic kept in `services/`, Pydantic models kept in `schemas/`, and
+  dependencies injected rather than imported as globals.

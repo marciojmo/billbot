@@ -12,3 +12,5 @@ wheels/
 # Env, db files
 .env
 billbot.db
+# macOS
+.DS_Store
