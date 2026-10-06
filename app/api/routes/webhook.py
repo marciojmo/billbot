@@ -1,64 +1,14 @@
 """Telegram webhook route handlers."""
 
-import httpx
-from fastapi import APIRouter, BackgroundTasks, status
+from fastapi import APIRouter, status
 from telegram import Update
 
-from app.core.config import settings
+from app.api.dependencies import BotDep, GatewayDep, QueueDep
+from app.bot import messages
+from app.bot.mapper import to_queue_message
 from app.schemas.telegram import TelegramUpdate
-from app.services.command_handler import get_start_message
-from app.services.message_handler import process_document, process_photo
 
 router = APIRouter(prefix="/webhook", tags=["webhook"])
-
-TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
-
-
-async def send_telegram_message(
-    chat_id: int,
-    text: str,
-    parse_mode: str | None = None,
-) -> None:
-    """Send a message to a Telegram chat.
-
-    Args:
-        chat_id: The target chat ID.
-        text: The message text to send.
-        parse_mode: Optional parse mode (Markdown, HTML).
-    """
-    url = TELEGRAM_API_URL.format(token=settings.telegram_bot_token)
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json=payload)
-
-
-async def process_and_respond(
-    update: Update,
-    chat_id: int,
-) -> None:
-    """Process an update and send the response.
-
-    Args:
-        update: The Telegram update to process.
-        chat_id: The chat ID to respond to.
-    """
-    message = update.message
-    if not message:
-        return
-
-    await send_telegram_message(chat_id, "🔄 Processando boleto...")
-
-    if message.document:
-        response = await process_document(message)
-    elif message.photo:
-        response = await process_photo(message)
-    else:
-        return
-
-    await send_telegram_message(chat_id, response, parse_mode="Markdown")
 
 
 @router.post(
@@ -69,31 +19,39 @@ async def process_and_respond(
 )
 async def receive_telegram_update(
     update: TelegramUpdate,
-    background_tasks: BackgroundTasks,
+    bot: BotDep,
+    gateway: GatewayDep,
+    queue: QueueDep,
 ) -> dict[str, str]:
-    """Receive and process a Telegram update.
+    """Receive a Telegram update and route it like polling mode does.
+
+    File messages are enqueued for processing; anything else gets the
+    greeting.
 
     Args:
         update: The raw Telegram update payload.
-        background_tasks: FastAPI background tasks for async processing.
+        bot: The Telegram bot, used to deserialize the update.
+        gateway: Telegram gateway for immediate replies.
+        queue: The message queue.
 
     Returns:
         A status message indicating the update was received.
     """
-    telegram_update = Update.de_json(update.to_dict(), bot=None)
+    message = Update.de_json(update.to_dict(), bot).message
+    if not message:
+        return {"status": "ok"}
 
-    if telegram_update.message:
-        message = telegram_update.message
-        name = message.from_user.first_name if message.from_user else "usuário"
-        chat_id = message.chat.id
+    chat_id = message.chat.id
+    if not (message.document or message.photo):
+        name = message.from_user.first_name if message.from_user else None
+        await gateway.send_message(chat_id, messages.format_start(name), markdown=False)
+        return {"status": "ok"}
 
-        if message.document or message.photo:
-            background_tasks.add_task(
-                process_and_respond,
-                telegram_update,
-                chat_id,
-            )
-        else:
-            await send_telegram_message(chat_id, get_start_message(name))
+    queue_msg = to_queue_message(message)
+    if not queue_msg:
+        await gateway.send_message(chat_id, messages.INVALID_MESSAGE, markdown=False)
+        return {"status": "ok"}
 
+    await queue.enqueue(queue_msg)
+    await gateway.send_message(chat_id, messages.PROCESSING, markdown=False)
     return {"status": "ok"}

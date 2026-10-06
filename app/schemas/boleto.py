@@ -1,4 +1,4 @@
-"""OCR result schemas."""
+"""Boleto schemas."""
 
 from pydantic import BaseModel, Field
 
@@ -40,3 +40,23 @@ class BoletoData(BaseModel):
         None,
         description="Additional extracted text or notes",
     )
+
+
+class StoredBoleto(BaseModel):
+    """A boleto as persisted for a user.
+
+    Attributes:
+        barcode: The barcode number (linha digitável).
+        due_date: The due date as originally extracted.
+        value: The value as originally extracted.
+        issuer: The issuer/company name.
+        confidence: OCR confidence level (0.0 to 1.0).
+        status: Payment status (pending, paid, expired).
+    """
+
+    barcode: str | None = None
+    due_date: str | None = None
+    value: str | None = None
+    issuer: str | None = None
+    confidence: float | None = None
+    status: str
